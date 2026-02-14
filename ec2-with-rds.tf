@@ -7,8 +7,14 @@ terraform {
   }
 }
 
+# provider "aws" {
+#   region = var.aws_region
+# }
+
 provider "aws" {
-  region = var.aws_region
+  shared_config_files      = ["~/.aws/config"]
+  shared_credentials_files = ["~/.aws/credentials"]
+  profile                  = var.aws_profile
 }
 
 # Variables
@@ -16,6 +22,12 @@ variable "aws_region" {
   description = "AWS region"
   type        = string
   default     = "us-east-1"
+}
+
+variable "aws_profile" {
+  description = "AWS profile to use"
+  type        = string
+  default     = "default"
 }
 
 variable "project_name" {
@@ -46,6 +58,16 @@ variable "db_instance_class" {
   description = "RDS instance class"
   type        = string
   default     = "db.t3.micro"
+}
+
+variable "ses_domain" {
+  description = "Domain for SES identity"
+  type        = string
+}
+
+variable "ses_email" {
+  description = "Email address for SES identity"
+  type        = string
 }
 
 # Data sources
@@ -227,9 +249,12 @@ resource "aws_db_instance" "postgres" {
   port                   = 5432
   vpc_security_group_ids = [aws_security_group.rds.id]
   db_subnet_group_name   = aws_db_subnet_group.main.name
-  multi_az               = false
-  publicly_accessible    = false
-  skip_final_snapshot    = true
+  multi_az                = false
+  publicly_accessible     = false
+  skip_final_snapshot     = true
+  backup_retention_period = 7
+  backup_window           = "03:00-04:00"
+  maintenance_window      = "Mon:04:00-Mon:05:00"
 
   tags = {
     Name = "${var.project_name}-db"
@@ -349,6 +374,149 @@ resource "aws_instance" "django" {
   }
 }
 
+# AWS Backup Vault
+resource "aws_backup_vault" "main" {
+  name = "${var.project_name}-backup-vault"
+
+  tags = {
+    Name = "${var.project_name}-backup-vault"
+  }
+}
+
+# IAM Role for AWS Backup
+resource "aws_iam_role" "backup_role" {
+  name = "${var.project_name}-backup-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "backup.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${var.project_name}-backup-role"
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "backup_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup"
+  role       = aws_iam_role.backup_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "restore_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores"
+  role       = aws_iam_role.backup_role.name
+}
+
+# AWS Backup Plan
+resource "aws_backup_plan" "main" {
+  name = "${var.project_name}-backup-plan"
+
+  rule {
+    rule_name         = "daily-backup"
+    target_vault_name = aws_backup_vault.main.name
+    schedule          = "cron(0 5 ? * * *)" # Daily at 5 AM UTC
+
+    lifecycle {
+      delete_after = 30 # Keep backups for 30 days
+    }
+
+    copy_action {
+      destination_vault_arn = aws_backup_vault.main.arn
+      lifecycle {
+        delete_after = 30
+      }
+    }
+  }
+
+  rule {
+    rule_name         = "weekly-backup"
+    target_vault_name = aws_backup_vault.main.name
+    schedule          = "cron(0 5 ? * 1 *)" # Weekly on Sunday at 5 AM UTC
+
+    lifecycle {
+      delete_after = 90 # Keep weekly backups for 90 days
+    }
+  }
+
+  tags = {
+    Name = "${var.project_name}-backup-plan"
+  }
+}
+
+# Backup Selection for EC2
+resource "aws_backup_selection" "ec2" {
+  iam_role_arn = aws_iam_role.backup_role.arn
+  name         = "${var.project_name}-ec2-backup"
+  plan_id      = aws_backup_plan.main.id
+
+  resources = [
+    aws_instance.django.arn
+  ]
+}
+
+# Backup Selection for RDS
+resource "aws_backup_selection" "rds" {
+  iam_role_arn = aws_iam_role.backup_role.arn
+  name         = "${var.project_name}-rds-backup"
+  plan_id      = aws_backup_plan.main.id
+
+  resources = [
+    aws_db_instance.postgres.arn
+  ]
+}
+
+# SES Domain Identity
+resource "aws_ses_domain_identity" "main" {
+  domain = var.ses_domain
+}
+
+resource "aws_ses_domain_dkim" "main" {
+  domain = aws_ses_domain_identity.main.domain
+}
+
+resource "aws_ses_domain_mail_from" "main" {
+  domain           = aws_ses_domain_identity.main.domain
+  mail_from_domain = "mail.${var.ses_domain}"
+}
+
+# SES Email Identity
+resource "aws_ses_email_identity" "main" {
+  email = var.ses_email
+}
+
+# IAM Policy for EC2 to send emails via SES
+resource "aws_iam_role_policy" "ec2_ses_policy" {
+  name = "${var.project_name}-ec2-ses-policy"
+  role = aws_iam_role.ec2_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ses:SendEmail",
+          "ses:SendRawEmail"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "ses:FromAddress" = var.ses_email
+          }
+        }
+      }
+    ]
+  })
+}
+
 # Outputs
 output "ec2_public_ip" {
   description = "Public IP of the EC2 instance"
@@ -378,4 +546,34 @@ output "s3_bucket_name" {
 output "s3_bucket_arn" {
   description = "S3 bucket ARN"
   value       = aws_s3_bucket.static.arn
+}
+
+output "backup_vault_arn" {
+  description = "AWS Backup vault ARN"
+  value       = aws_backup_vault.main.arn
+}
+
+output "backup_plan_id" {
+  description = "AWS Backup plan ID"
+  value       = aws_backup_plan.main.id
+}
+
+output "ses_domain_verification_token" {
+  description = "SES domain verification token - add as TXT record"
+  value       = aws_ses_domain_identity.main.verification_token
+}
+
+output "ses_dkim_tokens" {
+  description = "SES DKIM tokens - add as CNAME records"
+  value       = aws_ses_domain_dkim.main.dkim_tokens
+}
+
+output "ses_mail_from_domain" {
+  description = "SES mail from domain"
+  value       = aws_ses_domain_mail_from.main.mail_from_domain
+}
+
+output "ses_email_identity" {
+  description = "SES email identity"
+  value       = aws_ses_email_identity.main.email
 }
