@@ -50,11 +50,13 @@ ses_email  = "aws@musiccpr.org"
 
         > db_username = "your_db_admin"
         > db_password = "your_secure_password"
+
     2. Ensure you have an SSH key at ~/.ssh/id_rsa.pub (or update line 303) [sic]
     3. Run:
-        tofu init
-        tofu plan
-        tofu apply
+        
+        > tofu init
+        > tofu plan
+        > tofu apply
     
     The outputs will give you the EC2 public IP, RDS endpoint, and S3 bucket name to configure in your Django settings.
     ```
@@ -110,7 +112,7 @@ ses_email  = "aws@musiccpr.org"
     * Email identity for a specific email address
     * IAM policy allowing EC2 to send emails via SES (restricted to your specified sender address)
     
-    DNS records you'll need to add after apply:
+    **DNS records you'll need to add after apply:**
 
     1. TXT record for domain verification (value in ses_domain_verification_token output)
     2. 3 CNAME records for DKIM (values in ses_dkim_tokens output)
